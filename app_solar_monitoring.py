@@ -13,6 +13,13 @@ from datetime import datetime, timedelta
 import pickle
 from pathlib import Path
 import matplotlib.pyplot as plt
+import requests
+import json
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Page configuration
 st.set_page_config(
@@ -350,6 +357,205 @@ def plot_performance_ratio_trend(df, num_days=30):
     return fig
 
 
+def fetch_weather_forecast(api_key, lat, lon):
+    """
+    Fetch 5-day weather forecast from OpenWeather API (Free tier)
+
+    Uses the "5 Day / 3 Hour Forecast" API which is available for all free accounts
+    Returns DataFrame with 3-hourly weather predictions (40 data points = 5 days)
+    """
+    try:
+        # OpenWeather 5 Day / 3 Hour Forecast API - Free and available for all accounts
+        url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={api_key}&units=metric"
+
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        # Parse 3-hourly forecast data
+        forecast_data = []
+
+        for item in data.get('list', []):  # 40 data points (5 days * 8 per day)
+            forecast_data.append({
+                'timestamp': pd.to_datetime(item['dt'], unit='s'),
+                'temperature': item['main']['temp'],
+                'feels_like': item['main']['feels_like'],
+                'pressure': item['main']['pressure'],
+                'humidity': item['main']['humidity'],
+                'dew_point': item['main'].get('dew_point', item['main']['temp'] - 5),  # Estimate if not available
+                'clouds': item['clouds']['all'],
+                'wind_speed': item['wind']['speed'],
+                'wind_deg': item['wind'].get('deg', 0),
+                'weather_main': item['weather'][0]['main'],
+                'weather_description': item['weather'][0]['description'],
+            })
+
+        df = pd.DataFrame(forecast_data)
+        df.set_index('timestamp', inplace=True)
+
+        return df
+
+    except requests.exceptions.RequestException as e:
+        st.error(f"Erreur lors de la récupération des données météo: {e}")
+        return None
+    except (KeyError, IndexError) as e:
+        st.error(f"Format de réponse inattendu de l'API: {e}")
+        return None
+
+
+def create_forecast_features(weather_df, plant_config):
+    """
+    Create ML features from weather forecast data
+    Similar to features used during training
+    """
+    df = weather_df.copy()
+
+    # Basic time features
+    df['hour'] = df.index.hour
+    df['day_of_year'] = df.index.dayofyear
+    df['month'] = df.index.month
+    df['week_of_year'] = df.index.isocalendar().week
+
+    # Cyclical encoding
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+    df['day_sin'] = np.sin(2 * np.pi * df['day_of_year'] / 365)
+    df['day_cos'] = np.cos(2 * np.pi * df['day_of_year'] / 365)
+    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+
+    # Estimate GHI (Global Horizontal Irradiance) from cloud cover
+    # Simple estimation: max irradiance * (1 - cloud_cover)
+    # Max GHI varies by season and time of day
+    max_ghi = 1000  # W/m² typical maximum
+
+    # Reduce by cloud cover
+    df['ghi_estimated'] = max_ghi * (1 - df['clouds'] / 100)
+
+    # Zero GHI at night (simple heuristic: hour < 6 or hour > 18)
+    df.loc[(df['hour'] < 6) | (df['hour'] > 18), 'ghi_estimated'] = 0
+
+    # Apply solar angle adjustment (simple model)
+    # GHI is maximum at solar noon (12:00), follows sin curve
+    solar_angle_factor = np.sin(np.pi * (df['hour'] - 6) / 12).clip(0, 1)
+    df['ghi_estimated'] = df['ghi_estimated'] * solar_angle_factor
+
+    # Temperature features
+    df['temp_squared'] = df['temperature'] ** 2
+    df['temp_cubed'] = df['temperature'] ** 3
+
+    # Humidity features
+    df['humidity_squared'] = df['humidity'] ** 2
+
+    # Interaction features
+    df['ghi_temp'] = df['ghi_estimated'] * df['temperature']
+    df['ghi_humidity'] = df['ghi_estimated'] * df['humidity']
+    df['temp_humidity'] = df['temperature'] * df['humidity']
+
+    # Weather condition encoding (simplified)
+    df['is_clear'] = (df['clouds'] < 20).astype(int)
+    df['is_cloudy'] = ((df['clouds'] >= 20) & (df['clouds'] < 80)).astype(int)
+    df['is_overcast'] = (df['clouds'] >= 80).astype(int)
+
+    # Wind features
+    df['wind_speed_squared'] = df['wind_speed'] ** 2
+
+    return df
+
+
+def predict_production_forecast(weather_df, model, feature_columns):
+    """
+    Predict solar production using weather forecast and trained model
+    """
+    try:
+        # Ensure all required features exist
+        missing_features = [col for col in feature_columns if col not in weather_df.columns]
+
+        if missing_features:
+            # Add missing features with default values
+            for col in missing_features:
+                weather_df[col] = 0
+
+        # Select only the features used by the model
+        X_forecast = weather_df[feature_columns]
+
+        # Make predictions
+        predictions = model.predict(X_forecast)
+
+        # Ensure non-negative predictions
+        predictions = np.maximum(predictions, 0)
+
+        return predictions
+
+    except Exception as e:
+        st.error(f"Erreur lors de la prédiction: {e}")
+        return None
+
+
+def plot_forecast_daily(forecast_df):
+    """
+    Plot daily aggregated forecast
+    """
+    # Aggregate to daily totals
+    daily_forecast = forecast_df.groupby(forecast_df.index.date).agg({
+        'predicted_kwh': 'sum',
+        'temperature': 'mean',
+        'clouds': 'mean'
+    }).reset_index()
+
+    daily_forecast.columns = ['date', 'predicted_kwh', 'avg_temp', 'avg_clouds']
+
+    fig = go.Figure()
+
+    # Bar chart for predicted production
+    fig.add_trace(go.Bar(
+        x=daily_forecast['date'],
+        y=daily_forecast['predicted_kwh'],
+        name='Predicted Daily Production',
+        marker_color='#2ca02c',
+        text=[f"{val:.0f} kWh" for val in daily_forecast['predicted_kwh']],
+        textposition='outside'
+    ))
+
+    fig.update_layout(
+        title='5-Day Production Forecast (Daily Totals)',
+        xaxis_title='Date',
+        yaxis_title='Energy Production (kWh)',
+        height=400,
+        hovermode='x unified'
+    )
+
+    return fig
+
+
+def plot_forecast_hourly(forecast_df, selected_date):
+    """
+    Plot hourly forecast for a specific day
+    """
+    day_data = forecast_df[forecast_df.index.date == selected_date]
+
+    fig = go.Figure()
+
+    # Predicted production
+    fig.add_trace(go.Scatter(
+        x=day_data.index,
+        y=day_data['predicted_kwh'],
+        name='Predicted Production',
+        line=dict(color='#2ca02c', width=3),
+        mode='lines+markers'
+    ))
+
+    fig.update_layout(
+        title=f'3-Hourly Production Forecast - {selected_date}',
+        xaxis_title='Time',
+        yaxis_title='Energy Production (kWh / 3h)',
+        height=400,
+        hovermode='x unified'
+    )
+
+    return fig
+
+
 def main():
     """Main Streamlit app"""
 
@@ -414,12 +620,16 @@ def main():
     show_clearsky = st.sidebar.checkbox("Show Clear-Sky Reference", value=True)
     num_recent_days = st.sidebar.slider("Recent days to analyze", 7, 90, 30)
 
+    # Load OpenWeather API Key from environment variable
+    openweather_api_key = os.getenv('ow_key', '')
+
     # Main content
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📊 Overview",
         "📈 Detailed Analysis",
         "🚨 Anomaly Detection",
-        "📉 Model Performance"
+        "📉 Model Performance",
+        "🔮 5-Day Forecast"
     ])
 
     # TAB 1: OVERVIEW
@@ -669,6 +879,131 @@ def main():
             st.metric("Mean Error", f"{errors.mean():.2f} kWh")
         with col2:
             st.metric("Std Error", f"{errors.std():.2f} kWh")
+
+    # TAB 5: 5-DAY FORECAST
+    with tab5:
+        st.header("🔮 5-Day Production Forecast")
+
+        if not openweather_api_key:
+            st.warning("⚠️ OpenWeather API key not found in .env file (variable: ow_key)")
+            st.info("""
+            **How to get an OpenWeather API key:**
+            1. Go to [OpenWeather](https://openweathermap.org/api)
+            2. Sign up for a free account
+            3. Generate an API key (free tier includes 1,000 calls/day)
+            4. Add it to your .env file as: `ow_key=YOUR_API_KEY`
+
+            **Note:** Free tier uses "5 Day / 3 Hour Forecast" API (40 data points over 5 days).
+            """)
+        else:
+            with st.spinner('Fetching weather forecast from OpenWeather...'):
+                # Fetch weather forecast
+                weather_forecast = fetch_weather_forecast(
+                    openweather_api_key,
+                    PLANT_CONFIG['latitude'],
+                    PLANT_CONFIG['longitude']
+                )
+
+            if weather_forecast is not None and len(weather_forecast) > 0:
+                st.success(f"✅ Retrieved {len(weather_forecast)} forecast data points (5 days, 3-hour intervals)")
+
+                # Load model and features
+                model = load_model()
+
+                # Try to load feature columns
+                features_path = Path('models/feature_columns.pkl')
+                if features_path.exists():
+                    with open(features_path, 'rb') as f:
+                        feature_columns = pickle.load(f)
+                else:
+                    st.error("❌ Feature columns file not found. Please run the ML notebook to export the model.")
+                    st.stop()
+
+                if model is not None:
+                    # Create features from weather forecast
+                    with st.spinner('Creating features and predicting production...'):
+                        forecast_with_features = create_forecast_features(weather_forecast, PLANT_CONFIG)
+
+                        # Make predictions
+                        predictions = predict_production_forecast(forecast_with_features, model, feature_columns)
+
+                        if predictions is not None:
+                            forecast_with_features['predicted_kwh'] = predictions
+
+                            # Summary metrics
+                            st.subheader("📊 Forecast Summary")
+
+                            total_5day = forecast_with_features['predicted_kwh'].sum()
+                            num_days = len(forecast_with_features) / 8  # 8 data points per day (every 3 hours)
+                            daily_avg = total_5day / num_days if num_days > 0 else 0
+                            max_3h = forecast_with_features['predicted_kwh'].max()
+
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Total 5-Day Production", f"{total_5day:.1f} kWh")
+                            with col2:
+                                st.metric("Daily Average", f"{daily_avg:.1f} kWh/day")
+                            with col3:
+                                st.metric("Peak 3h Period", f"{max_3h:.1f} kWh")
+
+                            # Daily aggregated forecast
+                            st.subheader("📅 Daily Production Forecast")
+                            fig_daily = plot_forecast_daily(forecast_with_features)
+                            st.plotly_chart(fig_daily, use_container_width=True)
+
+                            # Detailed daily view
+                            st.subheader("🔍 3-Hourly Forecast Details")
+
+                            # Get unique dates
+                            forecast_dates = sorted(set(forecast_with_features.index.date))
+
+                            # Date selector
+                            selected_date = st.selectbox(
+                                "Select a day to view 3-hourly forecast:",
+                                forecast_dates,
+                                format_func=lambda x: x.strftime("%A, %B %d, %Y")
+                            )
+
+                            # Show hourly forecast for selected day
+                            fig_hourly = plot_forecast_hourly(forecast_with_features, selected_date)
+                            st.plotly_chart(fig_hourly, use_container_width=True)
+
+                            # Weather conditions table for selected day
+                            day_data = forecast_with_features[forecast_with_features.index.date == selected_date]
+
+                            st.subheader(f"🌤️ Weather Conditions - {selected_date}")
+
+                            # Show key weather parameters
+                            weather_display = day_data[['temperature', 'humidity', 'clouds', 'wind_speed', 'predicted_kwh']].copy()
+                            weather_display.columns = ['Temp (°C)', 'Humidity (%)', 'Clouds (%)', 'Wind (m/s)', 'Predicted (kWh)']
+                            weather_display.index = weather_display.index.strftime('%H:%M')
+
+                            st.dataframe(
+                                weather_display.style.format({
+                                    'Temp (°C)': '{:.1f}',
+                                    'Humidity (%)': '{:.0f}',
+                                    'Clouds (%)': '{:.0f}',
+                                    'Wind (m/s)': '{:.1f}',
+                                    'Predicted (kWh)': '{:.1f}'
+                                }).background_gradient(subset=['Predicted (kWh)'], cmap='YlGn'),
+                                use_container_width=True,
+                                height=400
+                            )
+
+                            # Download forecast as CSV
+                            st.subheader("📥 Export Forecast")
+
+                            csv_data = forecast_with_features[['temperature', 'humidity', 'clouds', 'wind_speed', 'predicted_kwh']].copy()
+                            csv_data.columns = ['Temperature_C', 'Humidity_pct', 'Clouds_pct', 'Wind_Speed_ms', 'Predicted_kWh']
+
+                            csv_string = csv_data.to_csv()
+
+                            st.download_button(
+                                label="Download 5-Day Forecast (CSV)",
+                                data=csv_string,
+                                file_name=f"solar_forecast_5day_{datetime.now().strftime('%Y%m%d')}.csv",
+                                mime="text/csv"
+                            )
 
     # Footer
     st.markdown("---")
