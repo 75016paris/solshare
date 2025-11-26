@@ -80,7 +80,7 @@ def load_data():
     """Load the processed hourly data with predictions"""
     try:
         # Try to load pre-computed predictions
-        data_path = Path('/Users/pr/Documents/_PRO/SIGFRID_DATA/SOLroof/data/predictions.parquet')
+        data_path = Path('data/predictions.parquet')
         if data_path.exists():
             df = pd.read_parquet(data_path)
             df.index = pd.to_datetime(df.index)
@@ -97,7 +97,7 @@ def load_data():
 def load_model():
     """Load the trained Ridge model"""
     try:
-        model_path = Path('/Users/pr/Documents/_PRO/SIGFRID_DATA/SOLroof/models/ridge_model.pkl')
+        model_path = Path('models/ridge_model.pkl')
         if model_path.exists():
             with open(model_path, 'rb') as f:
                 return pickle.load(f)
