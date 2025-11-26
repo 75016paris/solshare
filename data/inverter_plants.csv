@@ -1,0 +1,12 @@
+plant_id,plant_name,plant_address,plant_type,plant_capacity,system_type,inverter_provider,status
+15848107,DGL (GGI),,,1280.4,,,active
+1535729,SOLshare LM Tower,Dhaka,Commercial Rooftop,4.25,,,inactive
+1535728,BHC,Dhaka,Commercial Rooftop,15.66,,SMA,inactive
+11811249,ACCL (GGI),Gazipur,CommercialRoofTop,285.12,,,active
+11605154,NAL (GGI),Gazipur,Commercial Rooftop,227.04,,,active
+12018942,ACML (GGI),Gazipur,Commercial Rooftop,525.36,,,active
+11701955,CAL (GGI),Gazipur,Commercial Rooftop,522.72,,,active
+11838318,HKL (GGI),Gazipur,CommercialRoofTop,269.28,,,active
+1535726,Unilever Sales Depot Bogura,Bogura,Commercial Rooftop,39.6,All on Grid,Sungrow,active
+9977156,KCL (SOLshare),Narayangang,Commercial Rooftop,249.2,All on Grid,SMA,active
+1535725,Faruk Auto Garage Rajshahi,Rajshahi,Commercial Rooftop,18.53,All on Grid,Solarman,inactive
